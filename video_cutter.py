@@ -9,7 +9,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QSlider, QFileDialog,
                              QGroupBox, QSpinBox, QComboBox, QCheckBox, QProgressBar,
                              QMessageBox, QLineEdit, QRadioButton, QButtonGroup, QScrollArea, 
-                             QDoubleSpinBox, QStyle, QSizePolicy, QFrame, QGridLayout)
+                             QDoubleSpinBox, QStyle, QSizePolicy, QFrame, QGridLayout,
+                             QStyleOptionSlider)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QSize, QObject
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -120,10 +121,31 @@ class GPUCheckThread(QThread):
 class ClickableSlider(QSlider):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            val = self.minimum() + (self.maximum() - self.minimum()) * event.position().x() / self.width()
-            self.setValue(int(val))
-            self.sliderMoved.emit(int(val))
-            event.accept()
+            opt = QStyleOptionSlider()
+            self.initStyleOption(opt)
+            
+            # 取得滑塊 (Handle) 的精確位置與大小
+            handle_rect = self.style().subControlRect(
+                QStyle.ComplexControl.CC_Slider, opt, 
+                QStyle.SubControl.SC_SliderHandle, self)
+            
+            # 如果點擊的不是滑塊本身（也就是點擊在空白軌道上）
+            if not handle_rect.contains(event.position().toPoint()):
+                # 扣除滑塊寬度，計算實際的「軌道長度」
+                span = self.width() - handle_rect.width()
+                # 將滑鼠 X 座標平移到相對於軌道起點的位置
+                pos = int(event.position().x() - handle_rect.width() / 2)
+                
+                # 使用 Qt 內建函式精準換算對應數值（它會完美處理最左/最右的邊界問題）
+                val = QStyle.sliderValueFromPosition(
+                    self.minimum(), self.maximum(), pos, span, opt.upsideDown)
+                
+                # 瞬間把滑塊移到滑鼠底下
+                self.setValue(val)
+                self.sliderMoved.emit(val)
+                
+        # 最終統一交給父類別處理。
+        # 因為此時滑塊已經在滑鼠正下方了，底層系統會判定為「點擊滑塊」，順利啟動無縫拖曳！
         super().mousePressEvent(event)
 
 # --- 影片處理執行緒 ---
@@ -133,7 +155,7 @@ class VideoProcessor(QThread):
     
     def __init__(self, input_path, output_path, start_time, end_time, 
                  mode='copy', quality=23, fps=None, bitrate=None, 
-                 output_format='mp4', resolution=None, gpu_vendor='CPU', speed=1.0):
+                 output_format='mp4', resolution=None, gpu_vendor='CPU', speed=1.0, keep_hdr=False):
         super().__init__()
         self.input_path = input_path
         self.output_path = output_path
@@ -147,6 +169,7 @@ class VideoProcessor(QThread):
         self.resolution = resolution
         self.gpu_vendor = gpu_vendor
         self.speed = speed
+        self.keep_hdr = keep_hdr
         self.process = None
         
     def run(self):
@@ -171,37 +194,63 @@ class VideoProcessor(QThread):
             if self.mode == 'copy':
                 cmd.extend(['-c', 'copy'])
             else:
-                # --- [全顯卡完美修正版] 編碼器設定 ---
-                if self.gpu_vendor == 'NVIDIA':
-                    cmd.extend(['-c:v', 'h264_nvenc', '-preset', 'p4'])
-                    if not self.bitrate:
-                        if self.quality == 0:
-                            # NVIDIA: 0 = Auto(爛畫質)，所以必須強制用 constqp 0 (無損)
-                            cmd.extend(['-rc', 'constqp', '-qp', '0'])
-                        else:
-                            # NVIDIA: 非 0 時用 VBR，並解除碼率上限
-                            cmd.extend(['-rc', 'vbr', '-cq', str(self.quality), '-b:v', '0'])
+                # --- [根據 HDR 開關選擇編碼器] ---
+                if self.keep_hdr:
+                    # HDR 模式：使用 HEVC (H.265) 10-bit 與 BT.2020 色彩空間
+                    if self.gpu_vendor == 'NVIDIA':
+                        cmd.extend(['-c:v', 'hevc_nvenc', '-preset', 'p4', '-profile:v', 'main10', '-pix_fmt', 'p010le'])
+                        if not self.bitrate:
+                            cmd.extend(['-rc', 'constqp', '-qp', '0'] if self.quality == 0 else ['-rc', 'vbr', '-cq', str(self.quality), '-b:v', '0'])
+                    
+                    elif self.gpu_vendor == 'AMD':
+                        cmd.extend(['-c:v', 'hevc_amf', '-usage', 'transcoding', '-profile:v', 'main10', '-pix_fmt', 'p010le'])
+                        if not self.bitrate:
+                            cmd.extend(['-rc', 'cqp', '-qp_i', str(self.quality), '-qp_p', str(self.quality)])
+                    
+                    elif self.gpu_vendor == 'Intel':
+                        cmd.extend(['-c:v', 'hevc_qsv', '-preset', 'medium', '-profile:v', 'main10', '-pix_fmt', 'p010le'])
+                        if not self.bitrate:
+                            cmd.extend(['-global_quality', str(1 if self.quality == 0 else self.quality)])
+                    
+                    else: # CPU (x265)
+                        cmd.extend(['-c:v', 'libx265', '-preset', 'medium', '-pix_fmt', 'yuv420p10le'])
+                        if not self.bitrate:
+                            cmd.extend(['-crf', str(self.quality)])
+                    
+                    # 寫入 HDR (HDR10) 的色彩元數據
+                    cmd.extend([
+                        '-color_primaries', 'bt2020',
+                        '-color_trc', 'smpte2084',
+                        '-colorspace', 'bt2020nc'
+                    ])
                 
-                elif self.gpu_vendor == 'AMD':
-                    cmd.extend(['-c:v', 'h264_amf', '-usage', 'transcoding'])
-                    if not self.bitrate:
-                        # AMD: 0 就是 0 (無損)，直接用沒問題
-                        cmd.extend(['-rc', 'cqp', '-qp_i', str(self.quality), '-qp_p', str(self.quality)])
+                else:
+                    # 原本的 SDR (H.264) 模式
+                    if self.gpu_vendor == 'NVIDIA':
+                        cmd.extend(['-c:v', 'h264_nvenc', '-preset', 'p4', '-pix_fmt', 'yuv420p'])
+                        if not self.bitrate:
+                            if self.quality == 0:
+                                cmd.extend(['-rc', 'constqp', '-qp', '0'])
+                            else:
+                                cmd.extend(['-rc', 'vbr', '-cq', str(self.quality), '-b:v', '0'])
+                    
+                    elif self.gpu_vendor == 'AMD':
+                        cmd.extend(['-c:v', 'h264_amf', '-usage', 'transcoding', '-pix_fmt', 'yuv420p'])
+                        if not self.bitrate:
+                            cmd.extend(['-rc', 'cqp', '-qp_i', str(self.quality), '-qp_p', str(self.quality)])
+                    
+                    elif self.gpu_vendor == 'Intel':
+                        cmd.extend(['-c:v', 'h264_qsv', '-preset', 'medium', '-pix_fmt', 'yuv420p'])
+                        if not self.bitrate:
+                            q_val = 1 if self.quality == 0 else self.quality
+                            cmd.extend(['-global_quality', str(q_val)])
+                    
+                    else: # CPU (x264)
+                        cmd.extend(['-c:v', 'libx264', '-preset', 'medium', '-pix_fmt', 'yuv420p'])
+                        if not self.bitrate:
+                            cmd.extend(['-crf', str(self.quality)])
                 
-                elif self.gpu_vendor == 'Intel':
-                    cmd.extend(['-c:v', 'h264_qsv', '-preset', 'medium'])
-                    if not self.bitrate:
-                        # Intel: 範圍通常是 1-51，0 可能會無效，所以遇到 0 我們改成 1 (最高畫質)
-                        q_val = 1 if self.quality == 0 else self.quality
-                        cmd.extend(['-global_quality', str(q_val)])
-                
-                else: # CPU (x264)
-                    cmd.extend(['-c:v', 'libx264', '-preset', 'medium'])
-                    if not self.bitrate:
-                        # CPU: 0 代表無損，直接用沒問題
-                        cmd.extend(['-crf', str(self.quality)])
-                
-                # 碼率設定 (若有勾選，這會覆蓋上面的 CRF 設定)
+                # 碼率設定 (若有勾選，這會覆蓋上面的 CRF/CQ 設定)
                 if self.bitrate:
                     b_val = f'{self.bitrate}k'
                     cmd.extend(['-b:v', b_val, '-maxrate', b_val, '-bufsize', f'{self.bitrate * 2}k'])
@@ -235,7 +284,6 @@ class VideoProcessor(QThread):
                 startupinfo=startupinfo
             )
             
-            # 進度條... (以下省略，維持原樣)
             for line in self.process.stderr:
                 if 'time=' in line:
                     try:
@@ -298,8 +346,10 @@ class VideoCutter(QMainWindow):
                     break
         
     def initUI(self):
-        self.setWindowTitle('影片剪輯工具') # 修改標題
+        self.setWindowTitle('影片剪輯工具')
         self.setGeometry(100, 100, 1400, 900)
+        
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         
         icon_path = get_tool_path("app.ico")
         if os.path.exists(icon_path):
@@ -336,15 +386,14 @@ class VideoCutter(QMainWindow):
             QScrollArea { background-color: transparent; border: none; }
             QWidget#RightPanelContent { background-color: transparent; }
             
-            /* --- [新增] 檔案資訊卡片樣式 --- */
             QLabel#InfoTitle { color: #888; font-size: 11px; font-weight: normal; }
             QLabel#InfoValue { color: #00dede; font-size: 13px; font-weight: bold; }
             
-            /* --- [新增] 進階設定外框樣式 --- */
             QFrame#AdvancedFrame {
-                border: 1px solid #555555; /* 白色/深灰細框 */
-                border-radius: 6px;
-                background-color: #252525; 
+                border: 1px solid #4a4a4a; 
+                border-radius: 8px;
+                background-color: #2a2a2a; 
+                padding: 5px;
             }
         """)
         
@@ -576,9 +625,8 @@ class VideoCutter(QMainWindow):
         self.file_drop_area.setObjectName("DropLabel")
         right_panel_layout.addWidget(self.file_drop_area)
         
-        # --- [優化] 檔案資訊卡片 4-Grid ---
         self.file_info_box = QGroupBox("檔案資訊")
-        self.file_info_box.setVisible(False) # 預設隱藏
+        self.file_info_box.setVisible(False) 
         info_grid = QGridLayout()
         info_grid.setContentsMargins(10, 10, 10, 10)
         info_grid.setSpacing(5)
@@ -591,13 +639,11 @@ class VideoCutter(QMainWindow):
         for lbl in [self.lbl_res_val, self.lbl_fps_val, self.lbl_bitrate_val, self.lbl_dur_val]:
             lbl.setObjectName("InfoValue")
 
-        # Row 0
         info_grid.addWidget(QLabel("解析度:", objectName="InfoTitle"), 0, 0)
         info_grid.addWidget(self.lbl_res_val, 0, 1)
         info_grid.addWidget(QLabel("幀率:", objectName="InfoTitle"), 0, 2)
         info_grid.addWidget(self.lbl_fps_val, 0, 3)
         
-        # Row 1
         info_grid.addWidget(QLabel("碼率:", objectName="InfoTitle"), 1, 0)
         info_grid.addWidget(self.lbl_bitrate_val, 1, 1)
         info_grid.addWidget(QLabel("時長:", objectName="InfoTitle"), 1, 2)
@@ -606,17 +652,16 @@ class VideoCutter(QMainWindow):
         self.file_info_box.setLayout(info_grid)
         right_panel_layout.addWidget(self.file_info_box)
         
-        self.info_label = QLabel("") # 保留變數但不顯示，防錯
+        self.info_label = QLabel("") 
         self.info_label.setVisible(False)
         right_panel_layout.addStretch()
         
-        # --- 輸出設定 (含白色細框) ---
+        # --- 輸出設定 ---
         settings_group = QGroupBox("輸出設定")
         settings_layout = QVBoxLayout()
         settings_layout.setSpacing(10)
         settings_layout.setContentsMargins(15, 20, 15, 15)
         
-        # Mode Selection
         self.mode_group_btn = QButtonGroup()
         self.copy_mode_radio = QRadioButton("極速剪輯 (無損)")
         self.copy_mode_radio.setChecked(True)
@@ -629,14 +674,15 @@ class VideoCutter(QMainWindow):
         self.mode_group_btn.addButton(self.compress_mode_radio)
         settings_layout.addWidget(self.compress_mode_radio)
         
-        # --- [關鍵修改] Advanced Frame 外框 ---
         self.compress_widget = QFrame()
         self.compress_widget.setObjectName("AdvancedFrame")
         
+        # === UI 排版優化區 ===
         comp_grid = QGridLayout(self.compress_widget)
         comp_grid.setContentsMargins(15, 15, 15, 15)
-        comp_grid.setSpacing(10)
-        comp_grid.setColumnStretch(1, 1)
+        comp_grid.setSpacing(12) 
+        comp_grid.setColumnStretch(1, 0) 
+        comp_grid.setColumnStretch(2, 1) 
         
         def make_lbl(text):
             l = QLabel(text)
@@ -651,14 +697,14 @@ class VideoCutter(QMainWindow):
             return l
         
         # Row 0: 加速
-        comp_grid.addWidget(make_lbl("加速:"), 0, 0)
+        comp_grid.addWidget(make_lbl("硬體加速:"), 0, 0)
         self.gpu_combo = QComboBox()
         self.gpu_combo.addItems(['CPU', 'NVIDIA', 'AMD', 'Intel'])
         comp_grid.addWidget(self.gpu_combo, 0, 1)
         comp_grid.addWidget(make_desc("使用顯卡硬體加速轉檔"), 0, 2)
         
         # Row 1: 倍速
-        comp_grid.addWidget(make_lbl("倍速:"), 1, 0)
+        comp_grid.addWidget(make_lbl("播放倍速:"), 1, 0)
         self.speed_spin = QDoubleSpinBox()
         self.speed_spin.setRange(0.5, 2.0)
         self.speed_spin.setSingleStep(0.1)
@@ -668,53 +714,63 @@ class VideoCutter(QMainWindow):
         comp_grid.addWidget(make_desc("調整影片播放速度"), 1, 2)
         
         # Row 2: 分辨率
-        comp_grid.addWidget(make_lbl("分辨率:"), 2, 0)
+        comp_grid.addWidget(make_lbl("解析度:"), 2, 0)
         self.resolution_combo = QComboBox()
         self.resolution_combo.addItems(['原始', '4K', '2K', '1080p', '720p'])
         comp_grid.addWidget(self.resolution_combo, 2, 1)
         comp_grid.addWidget(make_desc("設定輸出影片解析度"), 2, 2)
         
-        # Row 3: CRF
-        comp_grid.addWidget(make_lbl("CRF:"), 3, 0)
+        # Row 3: CRF (畫質) 改到色彩空間上面
+        comp_grid.addWidget(make_lbl("畫質 (CRF):"), 3, 0)
         self.quality_spin = QSpinBox()
         self.quality_spin.setRange(0, 51)
         self.quality_spin.setValue(23)
         comp_grid.addWidget(self.quality_spin, 3, 1)
         comp_grid.addWidget(make_desc("數值越小畫質越好 (範圍 0~51)"), 3, 2)
+
+        # Row 4: HDR (色彩空間) 改到畫質下面
+        comp_grid.addWidget(make_lbl("色彩空間:"), 4, 0)
+        self.hdr_check = QCheckBox("保留 HDR (10-bit)")
+        comp_grid.addWidget(self.hdr_check, 4, 1)
+        comp_grid.addWidget(make_desc("使用 HEVC 編碼保留高動態色彩"), 4, 2)
         
-        # --- [修改] Row 4: FPS 獨立一行 + 說明 ---
-        self.fps_check = QCheckBox("FPS")
-        self.fps_check.setLayoutDirection(Qt.LayoutDirection.RightToLeft) # 讓勾選框靠右對齊文字
+        # Row 5: FPS
+        comp_grid.addWidget(make_lbl("影片幀率:"), 5, 0)
+        fps_layout = QHBoxLayout()
+        fps_layout.setContentsMargins(0, 0, 0, 0)
+        self.fps_check = QCheckBox("自訂")
         self.fps_spin = QSpinBox()
         self.fps_spin.setRange(1, 240)
         self.fps_spin.setValue(60)
         self.fps_spin.setEnabled(False)
         self.fps_check.stateChanged.connect(lambda: self.fps_spin.setEnabled(self.fps_check.isChecked()))
+        fps_layout.addWidget(self.fps_check)
+        fps_layout.addWidget(self.fps_spin)
+        fps_layout.addStretch() 
+        comp_grid.addLayout(fps_layout, 5, 1)
+        comp_grid.addWidget(make_desc("強制設定輸出幀率 (如 60)"), 5, 2) 
         
-        comp_grid.addWidget(self.fps_check, 4, 0, Qt.AlignmentFlag.AlignRight)
-        comp_grid.addWidget(self.fps_spin, 4, 1)
-        comp_grid.addWidget(make_desc("強制設定影片幀率 (如 60fps)"), 4, 2) 
-        
-        # --- [修改] Row 5: 碼率 獨立一行 + 說明 ---
-        self.bitrate_check = QCheckBox("碼率")
-        self.bitrate_check.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        # Row 6: 碼率
+        comp_grid.addWidget(make_lbl("影像碼率:"), 6, 0)
+        bitrate_layout = QHBoxLayout()
+        bitrate_layout.setContentsMargins(0, 0, 0, 0)
+        self.bitrate_check = QCheckBox("限制")
         self.bitrate_spin = QSpinBox()
         self.bitrate_spin.setRange(1000, 500000)
         self.bitrate_spin.setValue(10000)
         self.bitrate_spin.setEnabled(False)
         self.bitrate_check.stateChanged.connect(lambda: self.bitrate_spin.setEnabled(self.bitrate_check.isChecked()))
-        
-        comp_grid.addWidget(self.bitrate_check, 5, 0, Qt.AlignmentFlag.AlignRight)
-        comp_grid.addWidget(self.bitrate_spin, 5, 1)
-        comp_grid.addWidget(make_desc("控制影片數據流量 (kbps)"), 5, 2)
+        bitrate_layout.addWidget(self.bitrate_check)
+        bitrate_layout.addWidget(self.bitrate_spin)
+        bitrate_layout.addStretch() 
+        comp_grid.addLayout(bitrate_layout, 6, 1)
+        comp_grid.addWidget(make_desc("控制影片數據流量 (kbps)"), 6, 2)
         
         settings_layout.addWidget(self.compress_widget)
         
-        # --- [新增] 格式選擇與 GPU 按鈕並排區塊 (移出 Frame 放在下面) ---
         format_gpu_row = QHBoxLayout()
         format_gpu_row.setContentsMargins(5, 5, 5, 5)
         
-        # 左側: 格式選擇
         fmt_layout = QHBoxLayout()
         fmt_lbl = QLabel("格式:")
         fmt_lbl.setStyleSheet("font-size: 14px; font-weight: bold;")
@@ -726,9 +782,8 @@ class VideoCutter(QMainWindow):
         fmt_layout.addWidget(self.format_combo)
         
         format_gpu_row.addLayout(fmt_layout)
-        format_gpu_row.addStretch() # 中間推開
+        format_gpu_row.addStretch() 
         
-        # 右側: 檢測按鈕 (從 Frame 移出來放在這裡)
         self.detect_btn = QPushButton("檢測是否支持硬體加速")
         self.detect_btn.setFixedSize(180, 32)
         self.detect_btn.setStyleSheet("background-color: #5c2b2b; color: white; border-radius: 4px; font-weight: bold;")
@@ -741,7 +796,6 @@ class VideoCutter(QMainWindow):
         settings_group.setLayout(settings_layout)
         right_panel_layout.addWidget(settings_group)
         
-        # 4. 底部按鈕區 (簡化: 移除原本的格式選擇，只留預估大小與開始按鈕)
         bottom_box = QWidget()
         bottom_layout = QVBoxLayout(bottom_box)
         bottom_layout.setContentsMargins(0, 10, 0, 0)
@@ -777,7 +831,7 @@ class VideoCutter(QMainWindow):
         main_layout.addWidget(right_scroll_area, 1)
         
         self.setup_connections()
-        self.toggle_mode_options() # 初始化 UI 狀態
+        self.toggle_mode_options() 
         self.showMaximized()
         
     def setup_connections(self):
@@ -789,6 +843,15 @@ class VideoCutter(QMainWindow):
         self.bitrate_check.stateChanged.connect(self.estimate_file_size)
         self.bitrate_spin.valueChanged.connect(self.estimate_file_size)
         self.speed_spin.valueChanged.connect(self.estimate_file_size)
+        
+        for widget in self.findChildren(QPushButton):
+            widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        for widget in self.findChildren(QComboBox):
+            widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        for widget in self.findChildren(QCheckBox):
+            widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        for widget in self.findChildren(QRadioButton):
+            widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
     def start_gpu_check(self):
         self.detect_btn.setText("檢測中...")
@@ -814,16 +877,14 @@ class VideoCutter(QMainWindow):
     def toggle_mode_options(self):
         enable_adv = self.compress_mode_radio.isChecked()
         
-        # 這些是要鎖定的控制項
         controls_to_toggle = [
             self.gpu_combo, self.speed_spin, self.resolution_combo, self.quality_spin,
-            self.fps_check, self.bitrate_check
+            self.fps_check, self.bitrate_check, self.hdr_check
         ]
         
         for widget in controls_to_toggle:
             widget.setEnabled(enable_adv)
             
-        # FPS 和 碼率 SpinBox 還有額外的 CheckBox 連動邏輯
         if enable_adv:
             self.fps_spin.setEnabled(self.fps_check.isChecked())
             self.bitrate_spin.setEnabled(self.bitrate_check.isChecked())
@@ -893,7 +954,6 @@ class VideoCutter(QMainWindow):
                 height = video_stream.get('height', 'N/A')
                 fps = eval(video_stream.get('r_frame_rate', '0/1'))
                 
-                # 更新資訊卡片
                 self.lbl_res_val.setText(f"{width}x{height}")
                 self.lbl_fps_val.setText(f"{fps:.2f}")
                 self.lbl_bitrate_val.setText(f"{self.video_bitrate:.0f} kbps")
@@ -921,6 +981,13 @@ class VideoCutter(QMainWindow):
             self.media_player.play()
             self.play_btn.setText("⏸ 暫停")
             self.toggle_preview_speed()
+    
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Space:
+            event.accept() 
+            self.toggle_play()
+        else:
+            super().keyPressEvent(event)
     
     def step_video(self, direction):
         if self.media_player.mediaStatus() == QMediaPlayer.MediaStatus.NoMedia:
@@ -1055,6 +1122,8 @@ class VideoCutter(QMainWindow):
         bitrate = self.bitrate_spin.value() if mode == 'compress' and self.bitrate_check.isChecked() else None
         speed = self.speed_spin.value() if mode == 'compress' else 1.0 
         
+        keep_hdr = self.hdr_check.isChecked() if mode == 'compress' else False
+        
         resolution = None
         if mode == 'compress':
             res_text = self.resolution_combo.currentText()
@@ -1076,7 +1145,7 @@ class VideoCutter(QMainWindow):
         self.processor = VideoProcessor(
             self.video_path, output_path, start_time, end_time, 
             mode, quality, fps, bitrate, output_format, resolution, 
-            gpu_vendor, speed
+            gpu_vendor, speed, keep_hdr=keep_hdr
         )
         self.processor.progress.connect(self.progress_bar.setValue)
         self.processor.finished.connect(self.process_finished)
