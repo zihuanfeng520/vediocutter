@@ -8,6 +8,13 @@ from datetime import timedelta
 # --- 隱藏 PyQt6 內建播放器的煩人報錯 ---
 os.environ["QT_LOGGING_RULES"] = "qt.multimedia.*.warning=false;qt.multimedia.*.debug=false"
 
+# ==========================================
+# --- 新增：切換多媒體底層引擎解決綠屏問題 ---
+# 強迫 PyQt6 使用 Windows 原生的 Media Foundation 引擎，
+# 解決高幀率/高碼率 (如 NVIDIA 遊戲錄影) 在預設 FFmpeg 引擎下解碼失敗導致的綠畫面問題。
+os.environ["QT_MEDIA_BACKEND"] = "windows"
+# ==========================================
+
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QSlider, QFileDialog,
                              QGroupBox, QSpinBox, QComboBox, QCheckBox, QProgressBar,
